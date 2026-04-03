@@ -288,15 +288,25 @@ with st.sidebar:
     st.header("⚙️ Thiết lập ban đầu")
     uploaded_pdf = st.file_uploader("1. Tải tài liệu lên", type=["pdf"])
 
-    default_prompt = """Biên tập tài liệu này theo đúng chuẩn form đề thi:
-1. BẢNG TỪ VỰNG: CHỈ GIỮ LẠI ĐÚNG 2 CỘT là "Word" và "Meaning". ĐẶC BIỆT: Hãy XÓA SẠCH nội dung trong cột "Meaning" (để trống ô đó) để tạo bài tập điền từ. Lược bỏ tất cả các cột thừa (Synonym, Antonym...).
-2. CÂU HỎI TRẮC NGHIỆM:
-   - Bôi đậm chữ "Question" và số (VD: **Question 1.**).
-   - Bôi đậm các đáp án (VD: **A.**, **B.**, **C.**, **D.**).
-   - Các đáp án phải nằm trên cùng 1 dòng.
-3. LỌC RÁC: Xóa các thông tin như Link web, số điện thoại, tên giáo viên ở đầu/cuối tài liệu."""
+    # ==========================================
+    # HÀM AI - CẬP NHẬT LUẬT MỀM DẺO CHO BẢNG
+    # ==========================================
+    EDUCATIONAL_SYSTEM_PROMPT = """Bạn là một Chuyên gia Biên tập Đề thi và Tài liệu Giáo dục Tiếng Anh.
+    Nhiệm vụ của bạn là định dạng lại văn bản cực kỳ CHÍNH XÁC theo cấu trúc chuẩn.
+    LƯU Ý TỐI QUAN TRỌNG:
+    1. MARKDOWN: Dùng dấu sao đôi để in đậm (**chữ**). KHÔNG dùng thẻ HTML.
+    2. CÂU HỎI TRẮC NGHIỆM: 
+        - Bắt buộc in đậm chữ Question và số (VD: **Question 1.**). KHÔNG in đậm nội dung câu hỏi.
+        - Bắt buộc in đậm các chữ cái đáp án (VD: **A.**, **B.**, **C.**, **D.**).
+        - Các đáp án phải nằm trên cùng một dòng.
+    3. BẢNG BIỂU: Xử lý số lượng cột, nội dung cột CHÍNH XÁC theo yêu cầu của người dùng. Hãy linh hoạt thêm, bớt hoặc làm trống nội dung theo đúng mệnh lệnh.
+    4. LỌC RÁC: Xóa các thông tin như Link web, số điện thoại, tên giáo viên ở đầu/cuối tài liệu.
+    5. ĐOẠN VĂN ĐỌC HIỂU: Giữ nguyên sự liền mạch, không tự ý ngắt dòng giữa câu.
+    6. KHÔNG giao tiếp, KHÔNG giải thích. CHỈ TRẢ VỀ văn bản đã được biên tập."""
 
-    user_prompt = st.text_area("2. Yêu cầu xử lý:", value=default_prompt, height=350)
+    user_prompt = st.text_area(
+        "2. Yêu cầu xử lý:", value=EDUCATIONAL_SYSTEM_PROMPT, height=350
+    )
     process_btn = st.button(
         "🚀 Bắt đầu tạo Bản Nháp", type="primary", use_container_width=True
     )
