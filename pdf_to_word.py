@@ -116,7 +116,7 @@ def refine_text_with_ai(current_text, refinement_prompt, image_bytes=None):
 
 
 # ==========================================
-# 5. HÀM GHI FILE WORD (THUẬT TOÁN BẢNG TÀNG HÌNH)
+# 5. HÀM GHI FILE WORD (THUẬT TOÁN BẢNG TÀNG HÌNH CHIA ĐỀU)
 # ==========================================
 def create_word_docx(processed_text):
     doc = Document()
@@ -144,7 +144,6 @@ def create_word_docx(processed_text):
 
         # --- XỬ LÝ BẢNG TỪ VỰNG CÓ VIỀN ---
         if line_stripped.startswith("|") and line_stripped.endswith("|"):
-            # BẢN SỬA LỖI: Thêm dấu hai chấm (:) vào bộ lọc để chặn các dòng như |:---|:---|
             if re.match(r"^\|[\-\|\s:]+\|$", line_stripped):
                 continue
 
@@ -188,7 +187,7 @@ def create_word_docx(processed_text):
                             if j % 2 != 0:
                                 run.bold = True
 
-        # --- TẠO BẢNG TÀNG HÌNH ĐỂ ÉP CỘT TRẮC NGHIỆM A, B, C, D ---
+        # --- TẠO BẢNG TÀNG HÌNH ĐỂ ÉP CỘT TRẮC NGHIỆM A, B, C, D ĐỀU NHAU ---
         elif (
             "**A.**" in line
             and "**B.**" in line
@@ -197,21 +196,38 @@ def create_word_docx(processed_text):
         ):
             current_table = None
 
+            # 1. Tìm vị trí của các đáp án
+            idx_a = line.find("**A.**")
             idx_b = line.find("**B.**")
             idx_c = line.find("**C.**")
             idx_d = line.find("**D.**")
 
+            # 2. Xử lý phần "Question" nếu AI lỡ viết dính liền trên cùng 1 dòng
+            question_part = line[:idx_a].strip()
+            if question_part:
+                p_question = doc.add_paragraph()
+                q_parts = re.split(r"\*\*(.*?)\*\*", question_part)
+                for j, q_part in enumerate(q_parts):
+                    run = p_question.add_run(q_part)
+                    run.font.name = "Times New Roman"
+                    run.font.size = Pt(12)
+                    if j % 2 != 0:
+                        run.bold = True
+
+            # 3. Chia 4 đáp án
             parts_text = [
-                line[:idx_b].strip(),
+                line[idx_a:idx_b].strip(),
                 line[idx_b:idx_c].strip(),
                 line[idx_c:idx_d].strip(),
                 line[idx_d:].strip(),
             ]
 
+            # 4. Tạo bảng 1 hàng 4 cột (CHIA ĐỀU KÍCH THƯỚC)
             mc_table = doc.add_table(rows=1, cols=4)
             mc_table.autofit = False
 
-            widths = [Inches(2.3), Inches(1.4), Inches(1.4), Inches(1.4)]
+            # Ép 4 cột rộng bằng nhau tăm tắp (1.6 inches mỗi cột)
+            widths = [Inches(1.6), Inches(1.6), Inches(1.6), Inches(1.6)]
             for cell, width in zip(mc_table.rows[0].cells, widths):
                 cell.width = width
 
