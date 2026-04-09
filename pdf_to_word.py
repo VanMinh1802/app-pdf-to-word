@@ -6,6 +6,7 @@ import base64
 import pandas as pd
 import json
 import csv
+import time
 from docx.shared import Pt, RGBColor, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import nsdecls
@@ -77,24 +78,64 @@ def process_text_with_ai(raw_text, user_prompt):
 
 
 def process_vision_with_ai(images, user_prompt):
+    # Khuyến nghị: Đảm bảo bạn đang dùng model "gemini-2.5-flash" vì nó xử lý ảnh ổn định nhất hiện nay
     model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.1)
-    content = [
-        {
-            "type": "text",
-            "text": f"{EDUCATIONAL_SYSTEM_PROMPT}\n\nHãy đọc và gõ lại nội dung từ ảnh đính kèm theo ĐÚNG YÊU CẦU DƯỚI ĐÂY:\n{user_prompt}",
-        }
-    ]
-    for img in images:
-        buffered = io.BytesIO()
-        img.save(buffered, format="JPEG")
-        img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
-        content.append(
+    full_result = ""
+
+    # 1. ÉP XUỐNG 2 ẢNH/LẦN để giảm tải tối đa cho Google
+    batch_size = 2
+    total_batches = (len(images) + batch_size - 1) // batch_size
+
+    for i in range(0, len(images), batch_size):
+        current_batch = (i // batch_size) + 1
+        batch_images = images[i : i + batch_size]
+
+        content = [
             {
-                "type": "image_url",
-                "image_url": {"url": f"data:image/jpeg;base64,{img_str}"},
+                "type": "text",
+                "text": f"{EDUCATIONAL_SYSTEM_PROMPT}\n\nHãy đọc và gõ lại nội dung từ ảnh đính kèm theo ĐÚNG YÊU CẦU DƯỚI ĐÂY:\n{user_prompt}\n\n(LƯU Ý: Đây là Phần {current_batch}/{total_batches} của tài liệu. Hãy tiếp tục công việc định dạng.)",
             }
-        )
-    return model.invoke([HumanMessage(content=content)]).content
+        ]
+
+        for img in batch_images:
+            buffered = io.BytesIO()
+            img.save(buffered, format="JPEG")
+            img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{img_str}"},
+                }
+            )
+
+        # 2. CƠ CHẾ LÌ LỢM (AUTO-RETRY): Thử lại tối đa 3 lần cho mỗi lô nếu bị lỗi
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # Cố gắng gửi dữ liệu
+                response = model.invoke([HumanMessage(content=content)]).content
+                full_result += response + "\n\n"
+
+                # Nếu thành công, nghỉ ngơi 5 giây rồi mới làm lô tiếp theo
+                if current_batch < total_batches:
+                    time.sleep(5)
+
+                break  # Thoát khỏi vòng lặp retry vì đã thành công
+
+            except Exception as e:
+                error_msg = str(e)
+                # Nếu gặp lỗi 503 (Quá tải) hoặc 429 (Quá giới hạn rate limit)
+                if "503" in error_msg or "429" in error_msg:
+                    if attempt < max_retries - 1:
+                        # Đi ngủ 15 giây chờ Google hạ nhiệt rồi thử lại
+                        time.sleep(15)
+                        continue  # Quay lại đầu vòng lặp retry
+
+                # Nếu thử 3 lần vẫn thất bại, hoặc là lỗi khác không phải 503
+                full_result += f"\n\n[⚠️ AI BỊ LỖI KHI XỬ LÝ PHẦN {current_batch} SAU {max_retries} LẦN THỬ: {error_msg}]\n\n"
+                break
+
+    return full_result
 
 
 def refine_text_with_ai(current_text, refinement_prompt, image_bytes=None):
@@ -115,6 +156,15 @@ def refine_text_with_ai(current_text, refinement_prompt, image_bytes=None):
     else:
         full_prompt = f"{EDUCATIONAL_SYSTEM_PROMPT}\n\nBẢN THẢO HIỆN TẠI:\n<draft>\n{current_text}\n</draft>\n\nYÊU CẦU SỬA LỖI:\n{refinement_prompt}"
         return model.invoke(full_prompt).content
+
+
+def is_service_unavailable_error(error):
+    """Detect Google 503-like errors without requiring google.api_core at import time."""
+    error_name = error.__class__.__name__
+    message = str(error).lower()
+    return error_name == "ServiceUnavailable" or (
+        "503" in message and ("unavailable" in message or "overload" in message)
+    )
 
 
 # ==========================================
@@ -300,7 +350,7 @@ def extract_quiz_to_json(text):
         # Làm sạch JSON đầu ra
         clean_json = response.replace("```json", "").replace("```", "").strip()
         return json.loads(clean_json)
-    except Exception as e:
+    except Exception:
         return None
 
 
@@ -430,25 +480,43 @@ if process_btn:
         st.sidebar.error("Bạn chưa tải file PDF lên!")
     else:
         with st.status("Đang phân tích tài liệu...", expanded=True) as status:
-            st.write("Đang quét nội dung...")
-            raw_text = extract_text_from_upload(uploaded_pdf)
+            try:  # BẮT ĐẦU MẶC ÁO GIÁP
+                st.write("Đang quét nội dung...")
+                raw_text = extract_text_from_upload(uploaded_pdf)
 
-            if not raw_text.strip():
-                st.write("Phát hiện PDF ảnh scan! Chuyển sang Mắt thần Vision...")
-                images = extract_images_from_upload(uploaded_pdf)
-                result = process_vision_with_ai(images, user_prompt)
-            else:
-                st.write("Đang định dạng theo chuẩn đề thi...")
-                result = process_text_with_ai(raw_text, user_prompt)
+                if not raw_text.strip():
+                    st.write("Phát hiện PDF ảnh scan! Chuyển sang Mắt thần Vision...")
+                    images = extract_images_from_upload(uploaded_pdf)
 
-            st.session_state.draft_text = result
-            st.session_state.chat_history = [
-                {
-                    "role": "assistant",
-                    "content": "Tài liệu đã được định dạng. Cột Meaning đã được làm trống. Sếp kiểm tra lại nhé!",
-                }
-            ]
-            status.update(label="Hoàn tất xử lý!", state="complete", expanded=False)
+                    # BẪY UX: Cảnh báo nếu file quá dài (Tránh lỗi 503)
+                    if len(images) > 6:
+                        st.warning(
+                            f"⚠️ Tài liệu này có {len(images)} trang ảnh. Gửi file quá lớn có thể khiến AI Google từ chối phục vụ (Lỗi 503). Khuyên dùng file dưới 6 trang."
+                        )
+
+                    result = process_vision_with_ai(images, user_prompt)
+                else:
+                    st.write("Đang định dạng theo chuẩn đề thi...")
+                    result = process_text_with_ai(raw_text, user_prompt)
+
+                st.session_state.draft_text = result
+                st.session_state.chat_history = [
+                    {
+                        "role": "assistant",
+                        "content": "Tài liệu đã được định dạng. Cột Meaning đã được làm trống. Sếp kiểm tra lại nhé!",
+                    }
+                ]
+                status.update(label="Hoàn tất xử lý!", state="complete", expanded=False)
+
+            except Exception as e:
+                if is_service_unavailable_error(e):
+                    status.update(label="Lỗi máy chủ AI", state="error", expanded=False)
+                    st.error(
+                        "🤖 Máy chủ Google Gemini hiện đang quá tải (Lỗi 503) hoặc file của bạn quá nặng. Vui lòng cắt nhỏ file PDF ra hoặc chờ 1 phút rồi thử lại nhé!"
+                    )
+                else:
+                    status.update(label="Lỗi hệ thống", state="error", expanded=False)
+                    st.error(f"❌ Có lỗi xảy ra trong quá trình xử lý: {e}")
         st.rerun()
 
 if st.session_state.draft_text:
