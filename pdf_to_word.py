@@ -7,6 +7,7 @@ import pandas as pd
 import json
 import csv
 import time
+import concurrent.futures
 from docx.shared import Pt, RGBColor, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import nsdecls
@@ -77,63 +78,73 @@ def process_text_with_ai(raw_text, user_prompt):
     return model.invoke(full_prompt).content
 
 
-def process_vision_with_ai(images, user_prompt):
-    # Khuyến nghị: Đảm bảo bạn đang dùng model "gemini-2.5-flash" vì nó xử lý ảnh ổn định nhất hiện nay
+# --- Hàm phụ để xử lý từng lô (Batch) ---
+def process_single_batch(batch_images, batch_index, total_batches, user_prompt):
     model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.1)
-    full_result = ""
 
-    # 1. ÉP XUỐNG 2 ẢNH/LẦN để giảm tải tối đa cho Google
-    batch_size = 2
-    total_batches = (len(images) + batch_size - 1) // batch_size
+    content = [
+        {
+            "type": "text",
+            "text": f"{EDUCATIONAL_SYSTEM_PROMPT}\n\nYêu cầu: {user_prompt}\n(Đây là Phần {batch_index}/{total_batches})",
+        }
+    ]
 
-    for i in range(0, len(images), batch_size):
-        current_batch = (i // batch_size) + 1
-        batch_images = images[i : i + batch_size]
-
-        content = [
+    for img in batch_images:
+        buffered = io.BytesIO()
+        img.save(buffered, format="JPEG")
+        img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+        content.append(
             {
-                "type": "text",
-                "text": f"{EDUCATIONAL_SYSTEM_PROMPT}\n\nHãy đọc và gõ lại nội dung từ ảnh đính kèm theo ĐÚNG YÊU CẦU DƯỚI ĐÂY:\n{user_prompt}\n\n(LƯU Ý: Đây là Phần {current_batch}/{total_batches} của tài liệu. Hãy tiếp tục công việc định dạng.)",
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{img_str}"},
             }
-        ]
+        )
 
-        for img in batch_images:
-            buffered = io.BytesIO()
-            img.save(buffered, format="JPEG")
-            img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
-            content.append(
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{img_str}"},
-                }
-            )
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            return model.invoke([HumanMessage(content=content)]).content
+        except Exception as e:
+            if ("503" in str(e) or "429" in str(e)) and attempt < max_retries - 1:
+                time.sleep(10 + attempt * 5)  # Nghỉ lâu hơn nếu bị lỗi
+                continue
+            return f"\n[Lỗi Phần {batch_index}: {e}]\n"
 
-        # 2. CƠ CHẾ LÌ LỢM (AUTO-RETRY): Thử lại tối đa 3 lần cho mỗi lô nếu bị lỗi
-        max_retries = 3
-        for attempt in range(max_retries):
+
+# --- Hàm chính xử lý song song ---
+def process_vision_with_ai(images, user_prompt):
+    # Cấu hình: 2 ảnh/lô và chạy tối đa 4 luồng song song
+    batch_size = 2
+    max_workers = 4
+
+    batches = [images[i : i + batch_size] for i in range(0, len(images), batch_size)]
+    total_batches = len(batches)
+
+    # Dùng ThreadPoolExecutor để chạy song song
+    results_map = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Gửi tất cả các phần đi xử lý
+        future_to_batch = {
+            executor.submit(
+                process_single_batch, batches[i], i + 1, total_batches, user_prompt
+            ): i
+            for i in range(total_batches)
+        }
+
+        # Thu thập kết quả khi các luồng hoàn thành
+        for future in concurrent.futures.as_completed(future_to_batch):
+            batch_idx = future_to_batch[future]
             try:
-                # Cố gắng gửi dữ liệu
-                response = model.invoke([HumanMessage(content=content)]).content
-                full_result += response + "\n\n"
+                results_map[batch_idx] = future.result()
+            except Exception:
+                results_map[batch_idx] = (
+                    f"\n[Lỗi nghiêm trọng ở phần {batch_idx + 1}]\n"
+                )
 
-                # Nếu thành công, nghỉ ngơi 5 giây rồi mới làm lô tiếp theo
-                if current_batch < total_batches:
-                    time.sleep(5)
-
-                break  # Thoát khỏi vòng lặp retry vì đã thành công
-
-            except Exception as e:
-                error_msg = str(e)
-                # Nếu gặp lỗi 503 (Quá tải) hoặc 429 (Quá giới hạn rate limit)
-                if "503" in error_msg or "429" in error_msg:
-                    if attempt < max_retries - 1:
-                        # Đi ngủ 15 giây chờ Google hạ nhiệt rồi thử lại
-                        time.sleep(15)
-                        continue  # Quay lại đầu vòng lặp retry
-
-                # Nếu thử 3 lần vẫn thất bại, hoặc là lỗi khác không phải 503
-                full_result += f"\n\n[⚠️ AI BỊ LỖI KHI XỬ LÝ PHẦN {current_batch} SAU {max_retries} LẦN THỬ: {error_msg}]\n\n"
-                break
+    # Ghép kết quả theo đúng thứ tự từ đầu đến cuối
+    full_result = ""
+    for i in range(total_batches):
+        full_result += results_map[i] + "\n\n"
 
     return full_result
 
@@ -320,7 +331,9 @@ def create_word_docx(processed_text):
 # 6. HÀM AI: TỰ ĐỘNG GIẢI ĐỀ & TRÍCH XUẤT JSON
 # ==========================================
 def extract_quiz_to_json(text):
+    # Dùng 1.5-flash để tốc độ nhanh và chịu tải text dài tốt hơn
     model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.1)
+
     prompt = f"""
     Đọc tài liệu sau và tìm TẤT CẢ các câu hỏi trắc nghiệm. 
     Nhiệm vụ của bạn là trích xuất dữ liệu theo CÁC QUY TẮC TUYỆT ĐỐI SAU:
@@ -345,52 +358,50 @@ def extract_quiz_to_json(text):
     TÀI LIỆU GỐC:
     {text}
     """
-    try:
-        response = model.invoke(prompt).content
-        # Làm sạch JSON đầu ra
-        clean_json = response.replace("```json", "").replace("```", "").strip()
-        return json.loads(clean_json)
-    except Exception:
-        return None
+
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = model.invoke(prompt).content
+            clean_json = response.replace("```json", "").replace("```", "").strip()
+
+            # Cố gắng dịch cục text thành JSON
+            return json.loads(clean_json)
+
+        except Exception as e:
+            error_msg = str(e)
+
+            # Nếu gặp lỗi Google quá tải, đi ngủ 15s rồi thử lại
+            if "503" in error_msg or "429" in error_msg:
+                if attempt < max_retries - 1:
+                    time.sleep(15)
+                    continue
+
+            # NẾU LỖI LÀ DO AI VIẾT SAI FORMAT JSON HOẶC LỖI KHÁC BẤT NGỜ
+            import streamlit as st
+
+            st.error(f"❌ Lỗi trích xuất dữ liệu ở lần thử {attempt + 1}: {error_msg}")
+
+            # Phơi bày nguyên văn những gì AI đã viết để bạn soi xem nó ngo nguậy chỗ nào
+            if "response" in locals():
+                with st.expander(
+                    "👀 Bấm vào đây để xem AI đã viết rác gì khiến hệ thống lỗi"
+                ):
+                    st.text(response)
+
+            return None
+
+    return None
 
 
 # ==========================================
-# 7. HÀM PYTHON: TẠO FILE CHO KAHOOT & BLOOKET
+# 7. HÀM PYTHON: TẠO FILE CHO KAHOOT & BLOOKET (SIÊU TỐC)
 # ==========================================
 def generate_edtech_files(quiz_json):
-    # --- 1. Tạo file Excel cho KAHOOT ---
     kahoot_data = []
-    for q in quiz_json:
-        # Xử lý dứt điểm vụ AI đếm từ 0
-        ans_idx = q["correct_index"]
-        if ans_idx == 0:
-            ans_idx = 1  # Ép số 0 thành số 1 (Hoặc bạn có thể code ans_idx += 1 nếu muốn A=1, B=2, C=3, D=4)
-        elif ans_idx > 4:
-            ans_idx = 4
 
-        kahoot_data.append(
-            {
-                "Question - max 120 characters": q["question"][:120],
-                "Answer 1 - max 75 characters": q["answers"][0][:75],
-                "Answer 2 - max 75 characters": q["answers"][1][:75],
-                "Answer 3 - max 75 characters": q["answers"][2][:75],
-                "Answer 4 - max 75 characters": q["answers"][3][:75],
-                "Time limit (sec) - 5, 10, 20, 30, 60, 90, 120, or 240": 20,
-                "Correct answer(s) - 1, 2, 3, or 4": ans_idx,  # Đưa biến đã xử lý vào đây
-            }
-        )
-    df_kahoot = pd.DataFrame(kahoot_data)
-    kahoot_io = io.BytesIO()
-    df_kahoot.to_excel(kahoot_io, index=False, engine="openpyxl")
-    kahoot_io.seek(0)
-
-    # --- 2. Tạo file CSV cho BLOOKET (Dùng thư viện csv chuẩn) ---
     blooket_io = io.StringIO()
-
-    # CÚ HACK LỊCH SỬ: Chèn 1 dòng giả vào đầu file để Blooket ăn mất dòng này thay vì ăn mất câu 1
     blooket_io.write("Blooket Dummy Title,,,,,,,\n")
-
-    # Định nghĩa fieldnames (Dòng này sẽ bị đẩy xuống thành Row 2)
     fieldnames = [
         "Question #",
         "Question Text",
@@ -401,42 +412,55 @@ def generate_edtech_files(quiz_json):
         "Time Limit (sec)",
         "Correct Answer(s)",
     ]
-
     writer = csv.DictWriter(blooket_io, fieldnames=fieldnames, lineterminator="\n")
     writer.writeheader()
 
-    # Dữ liệu thật sự sẽ bắt đầu từ Row 3, an toàn tuyệt đối!
+    # CHỈ DÙNG 1 VÒNG LẶP DUY NHẤT CHO CẢ 2 NỀN TẢNG
     for i, q in enumerate(quiz_json):
         ans_idx = q["correct_index"]
-        if ans_idx == 0:
-            ans_idx = 1
-        elif ans_idx > 4:
-            ans_idx = 4
+        ans_idx = 1 if ans_idx == 0 else (4 if ans_idx > 4 else ans_idx)
 
-        clean_question = (
-            str(q["question"]).replace("\n", " ").replace("\r", " ").strip()
+        # Dọn rác văn bản (Chỉ làm 1 lần)
+        clean_q = str(q["question"]).replace("\n", " ").replace("\r", " ").strip()
+        clean_a1 = str(q["answers"][0]).replace("\n", " ").strip()
+        clean_a2 = str(q["answers"][1]).replace("\n", " ").strip()
+        clean_a3 = str(q["answers"][2]).replace("\n", " ").strip()
+        clean_a4 = str(q["answers"][3]).replace("\n", " ").strip()
+
+        # 1. Đút dữ liệu vào mảng Kahoot
+        kahoot_data.append(
+            {
+                "Question - max 120 characters": clean_q[:120],
+                "Answer 1 - max 75 characters": clean_a1[:75],
+                "Answer 2 - max 75 characters": clean_a2[:75],
+                "Answer 3 - max 75 characters": clean_a3[:75],
+                "Answer 4 - max 75 characters": clean_a4[:75],
+                "Time limit (sec) - 5, 10, 20, 30, 60, 90, 120, or 240": 20,
+                "Correct answer(s) - 1, 2, 3, or 4": ans_idx,
+            }
         )
-        clean_ans1 = str(q["answers"][0]).replace("\n", " ").strip()
-        clean_ans2 = str(q["answers"][1]).replace("\n", " ").strip()
-        clean_ans3 = str(q["answers"][2]).replace("\n", " ").strip()
-        clean_ans4 = str(q["answers"][3]).replace("\n", " ").strip()
 
+        # 2. Viết trực tiếp dữ liệu vào Blooket CSV
         writer.writerow(
             {
                 "Question #": i + 1,
-                "Question Text": clean_question,
-                "Answer 1": clean_ans1,
-                "Answer 2": clean_ans2,
-                "Answer 3": clean_ans3,
-                "Answer 4": clean_ans4,
+                "Question Text": clean_q,
+                "Answer 1": clean_a1,
+                "Answer 2": clean_a2,
+                "Answer 3": clean_a3,
+                "Answer 4": clean_a4,
                 "Time Limit (sec)": 20,
                 "Correct Answer(s)": ans_idx,
             }
         )
 
-    blooket_csv_bytes = blooket_io.getvalue().encode("utf-8")
+    # Đóng gói Excel cho Kahoot
+    df_kahoot = pd.DataFrame(kahoot_data)
+    kahoot_io = io.BytesIO()
+    df_kahoot.to_excel(kahoot_io, index=False, engine="openpyxl")
+    kahoot_io.seek(0)
 
-    return kahoot_io, blooket_csv_bytes
+    return kahoot_io, blooket_io.getvalue().encode("utf-8")
 
 
 # ==========================================
@@ -532,8 +556,13 @@ if st.session_state.draft_text:
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         )
 
+        # --- CẬP NHẬT GIAO DIỆN XUẤT FILE GAME ---
         st.divider()
         st.markdown("### 🎮 Xuất file Game (Kahoot/Blooket)")
+
+        # Khởi tạo bộ nhớ tạm để giữ file không bị mất khi load lại trang
+        if "game_files" not in st.session_state:
+            st.session_state.game_files = None
 
         if st.button("🎲 Tự động Giải đề & Trích xuất File Game", type="secondary"):
             with st.spinner(
@@ -542,28 +571,39 @@ if st.session_state.draft_text:
                 quiz_data = extract_quiz_to_json(st.session_state.draft_text)
 
                 if quiz_data:
+                    # Tạo file cực nhanh với hàm đã tối ưu
                     kahoot_file, blooket_file = generate_edtech_files(quiz_data)
-                    st.success("Đã trích xuất thành công! Hãy tải file bên dưới:")
-
-                    # Nút tải file Kahoot
-                    st.download_button(
-                        label="🟣 Tải file Excel cho KAHOOT!",
-                        data=kahoot_file,
-                        file_name="Kahoot_Template.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    )
-
-                    # Nút tải file Blooket
-                    st.download_button(
-                        label="🟦 Tải file CSV cho BLOOKET",
-                        data=blooket_file,
-                        file_name="Blooket_Template.csv",  # Đổi đuôi về CSV
-                        mime="text/csv",  # Đổi mime type
+                    # LƯU VÀO BỘ NHỚ
+                    st.session_state.game_files = (kahoot_file, blooket_file)
+                    st.success(
+                        "Đã trích xuất thành công! Bạn có thể tải file bất cứ lúc nào bên dưới:"
                     )
                 else:
                     st.error(
                         "❌ Không tìm thấy câu hỏi trắc nghiệm hoặc có lỗi xảy ra."
                     )
+
+        # Hiển thị nút tải xuống MÀ KHÔNG BỊ PHỤ THUỘC VÀO NÚT BẤM BÊN TRÊN
+        if st.session_state.game_files:
+            k_file, b_file = st.session_state.game_files
+
+            col1, col2 = st.columns(2)
+            with col1:
+                st.download_button(
+                    label="🟣 Tải file Excel cho KAHOOT!",
+                    data=k_file,
+                    file_name="Kahoot_Template.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            with col2:
+                st.download_button(
+                    label="🟦 Tải file CSV cho BLOOKET",
+                    data=b_file,
+                    file_name="Blooket_Template.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
 
         st.container(height=500, border=True).markdown(st.session_state.draft_text)
 
