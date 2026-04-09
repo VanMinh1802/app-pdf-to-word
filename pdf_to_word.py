@@ -3,6 +3,9 @@ import pdfplumber
 import re
 import io
 import base64
+import pandas as pd
+import json
+import csv
 from docx.shared import Pt, RGBColor, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import nsdecls
@@ -51,7 +54,7 @@ def extract_images_from_upload(uploaded_file):
 
 
 # ==========================================
-# HÀM AI - CẬP NHẬT LUẬT LÀM TRỐNG CỘT
+# HÀM AI - CẬP NHẬT LUẬT MỀM DẺO CHO BẢNG
 # ==========================================
 EDUCATIONAL_SYSTEM_PROMPT = """Bạn là một Chuyên gia Biên tập Đề thi và Tài liệu Giáo dục Tiếng Anh.
 Nhiệm vụ của bạn là định dạng lại văn bản cực kỳ CHÍNH XÁC theo cấu trúc chuẩn.
@@ -61,11 +64,10 @@ LƯU Ý TỐI QUAN TRỌNG:
    - Bắt buộc in đậm chữ Question và số (VD: **Question 1.**). KHÔNG in đậm nội dung câu hỏi.
    - Bắt buộc in đậm các chữ cái đáp án (VD: **A.**, **B.**, **C.**, **D.**).
    - Các đáp án phải nằm trên cùng một dòng.
-3. BẢNG TỪ VỰNG: 
-   - CHỈ ĐƯỢC TẠO BẢNG 2 CỘT là "Word" và "Meaning". Tuyệt đối XÓA BỎ các cột thừa (Synonym, Antonym...).
-   - ĐẶC BIỆT: Bạn BẮT BUỘC phải XÓA SẠCH nội dung của cột "Meaning" (để trống hoàn toàn các ô ở cột Meaning) để học sinh tự điền.
-4. ĐOẠN VĂN ĐỌC HIỂU: Giữ nguyên sự liền mạch, không tự ý ngắt dòng giữa câu.
-5. KHÔNG giao tiếp, KHÔNG giải thích. CHỈ TRẢ VỀ văn bản đã được biên tập."""
+3. BẢNG BIỂU: Xử lý số lượng cột, nội dung cột CHÍNH XÁC theo yêu cầu của người dùng. Hãy linh hoạt thêm, bớt hoặc làm trống nội dung theo đúng mệnh lệnh.
+4. LỌC RÁC: Xóa các thông tin như Link web, số điện thoại, tên giáo viên ở đầu/cuối tài liệu.
+5. ĐOẠN VĂN ĐỌC HIỂU: Giữ nguyên sự liền mạch, không tự ý ngắt dòng giữa câu.
+6. KHÔNG giao tiếp, KHÔNG giải thích. CHỈ TRẢ VỀ văn bản đã được biên tập."""
 
 
 def process_text_with_ai(raw_text, user_prompt):
@@ -265,6 +267,129 @@ def create_word_docx(processed_text):
 
 
 # ==========================================
+# 6. HÀM AI: TỰ ĐỘNG GIẢI ĐỀ & TRÍCH XUẤT JSON
+# ==========================================
+def extract_quiz_to_json(text):
+    model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.1)
+    prompt = f"""
+    Đọc tài liệu sau và tìm TẤT CẢ các câu hỏi trắc nghiệm. 
+    Nhiệm vụ của bạn là trích xuất dữ liệu theo CÁC QUY TẮC TUYỆT ĐỐI SAU:
+
+    1. CÂU HỎI: 
+       - NẾU LÀ CÂU HỘI THOẠI / ĐỌC HIỂU: Hãy tóm tắt lại hoặc gộp chúng thành 1 CÂU DUY NHẤT. 
+       - NẾU LÀ BÀI ĐIỀN TỪ: Chỉ trích xuất đúng 1 câu văn chứa chỗ trống.
+       - TUYỆT ĐỐI KHÔNG SỬ DỤNG KÝ TỰ XUỐNG DÒNG. Toàn bộ câu hỏi phải nằm trên 1 dòng thẳng tắp.
+    2. ĐÁP ÁN: Trích xuất đúng 4 đáp án (XÓA BỎ các ký tự A., B., C., D. ở đầu).
+    3. ĐÓNG VAI GIÁO VIÊN: Tự động giải đề để tìm ra đáp án đúng.
+    
+    TRẢ VỀ ĐÚNG ĐỊNH DẠNG JSON SAU (Không chứa text nào khác):
+    [
+        {{
+            "question": "Nội dung câu hỏi (Tuyệt đối không có dấu xuống dòng)?",
+            "answers": ["Đáp án 1", "Đáp án 2", "Đáp án 3", "Đáp án 4"],
+            "correct_index": 1, 
+            "correct_text": "COPY CHÍNH XÁC 100% text từ 1 trong 4 đáp án trên"
+        }}
+    ]
+    
+    TÀI LIỆU GỐC:
+    {text}
+    """
+    try:
+        response = model.invoke(prompt).content
+        # Làm sạch JSON đầu ra
+        clean_json = response.replace("```json", "").replace("```", "").strip()
+        return json.loads(clean_json)
+    except Exception as e:
+        return None
+
+
+# ==========================================
+# 7. HÀM PYTHON: TẠO FILE CHO KAHOOT & BLOOKET
+# ==========================================
+def generate_edtech_files(quiz_json):
+    # --- 1. Tạo file Excel cho KAHOOT ---
+    kahoot_data = []
+    for q in quiz_json:
+        # Xử lý dứt điểm vụ AI đếm từ 0
+        ans_idx = q["correct_index"]
+        if ans_idx == 0:
+            ans_idx = 1  # Ép số 0 thành số 1 (Hoặc bạn có thể code ans_idx += 1 nếu muốn A=1, B=2, C=3, D=4)
+        elif ans_idx > 4:
+            ans_idx = 4
+
+        kahoot_data.append(
+            {
+                "Question - max 120 characters": q["question"][:120],
+                "Answer 1 - max 75 characters": q["answers"][0][:75],
+                "Answer 2 - max 75 characters": q["answers"][1][:75],
+                "Answer 3 - max 75 characters": q["answers"][2][:75],
+                "Answer 4 - max 75 characters": q["answers"][3][:75],
+                "Time limit (sec) - 5, 10, 20, 30, 60, 90, 120, or 240": 20,
+                "Correct answer(s) - 1, 2, 3, or 4": ans_idx,  # Đưa biến đã xử lý vào đây
+            }
+        )
+    df_kahoot = pd.DataFrame(kahoot_data)
+    kahoot_io = io.BytesIO()
+    df_kahoot.to_excel(kahoot_io, index=False, engine="openpyxl")
+    kahoot_io.seek(0)
+
+    # --- 2. Tạo file CSV cho BLOOKET (Dùng thư viện csv chuẩn) ---
+    blooket_io = io.StringIO()
+
+    # CÚ HACK LỊCH SỬ: Chèn 1 dòng giả vào đầu file để Blooket ăn mất dòng này thay vì ăn mất câu 1
+    blooket_io.write("Blooket Dummy Title,,,,,,,\n")
+
+    # Định nghĩa fieldnames (Dòng này sẽ bị đẩy xuống thành Row 2)
+    fieldnames = [
+        "Question #",
+        "Question Text",
+        "Answer 1",
+        "Answer 2",
+        "Answer 3",
+        "Answer 4",
+        "Time Limit (sec)",
+        "Correct Answer(s)",
+    ]
+
+    writer = csv.DictWriter(blooket_io, fieldnames=fieldnames, lineterminator="\n")
+    writer.writeheader()
+
+    # Dữ liệu thật sự sẽ bắt đầu từ Row 3, an toàn tuyệt đối!
+    for i, q in enumerate(quiz_json):
+        ans_idx = q["correct_index"]
+        if ans_idx == 0:
+            ans_idx = 1
+        elif ans_idx > 4:
+            ans_idx = 4
+
+        clean_question = (
+            str(q["question"]).replace("\n", " ").replace("\r", " ").strip()
+        )
+        clean_ans1 = str(q["answers"][0]).replace("\n", " ").strip()
+        clean_ans2 = str(q["answers"][1]).replace("\n", " ").strip()
+        clean_ans3 = str(q["answers"][2]).replace("\n", " ").strip()
+        clean_ans4 = str(q["answers"][3]).replace("\n", " ").strip()
+
+        writer.writerow(
+            {
+                "Question #": i + 1,
+                "Question Text": clean_question,
+                "Answer 1": clean_ans1,
+                "Answer 2": clean_ans2,
+                "Answer 3": clean_ans3,
+                "Answer 4": clean_ans4,
+                "Time Limit (sec)": 20,
+                "Correct Answer(s)": ans_idx,
+            }
+        )
+
+    blooket_csv_bytes = blooket_io.getvalue().encode("utf-8")
+
+    return kahoot_io, blooket_csv_bytes
+
+
+# ==========================================
 # GIAO DIỆN STREAMLIT
 # ==========================================
 st.markdown(
@@ -288,24 +413,13 @@ with st.sidebar:
     st.header("⚙️ Thiết lập ban đầu")
     uploaded_pdf = st.file_uploader("1. Tải tài liệu lên", type=["pdf"])
 
-    # ==========================================
-    # HÀM AI - CẬP NHẬT LUẬT MỀM DẺO CHO BẢNG
-    # ==========================================
-    EDUCATIONAL_SYSTEM_PROMPT = """Bạn là một Chuyên gia Biên tập Đề thi và Tài liệu Giáo dục Tiếng Anh.
-    Nhiệm vụ của bạn là định dạng lại văn bản cực kỳ CHÍNH XÁC theo cấu trúc chuẩn.
-    LƯU Ý TỐI QUAN TRỌNG:
-    1. MARKDOWN: Dùng dấu sao đôi để in đậm (**chữ**). KHÔNG dùng thẻ HTML.
-    2. CÂU HỎI TRẮC NGHIỆM: 
-        - Bắt buộc in đậm chữ Question và số (VD: **Question 1.**). KHÔNG in đậm nội dung câu hỏi.
-        - Bắt buộc in đậm các chữ cái đáp án (VD: **A.**, **B.**, **C.**, **D.**).
-        - Các đáp án phải nằm trên cùng một dòng.
-    3. BẢNG BIỂU: Xử lý số lượng cột, nội dung cột CHÍNH XÁC theo yêu cầu của người dùng. Hãy linh hoạt thêm, bớt hoặc làm trống nội dung theo đúng mệnh lệnh.
-    4. LỌC RÁC: Xóa các thông tin như Link web, số điện thoại, tên giáo viên ở đầu/cuối tài liệu.
-    5. ĐOẠN VĂN ĐỌC HIỂU: Giữ nguyên sự liền mạch, không tự ý ngắt dòng giữa câu.
-    6. KHÔNG giao tiếp, KHÔNG giải thích. CHỈ TRẢ VỀ văn bản đã được biên tập."""
+    # YÊU CẦU MẶC ĐỊNH (Người dùng có thể xóa đi gõ lại trên Web)
+    default_user_prompt = """Biên tập tài liệu này theo đúng chuẩn form đề thi:
+1. BẢNG TỪ VỰNG: CHỈ GIỮ LẠI ĐÚNG 2 CỘT là "Word" và "Meaning". ĐẶC BIỆT: Hãy XÓA SẠCH nội dung trong cột "Meaning" (để trống ô đó) để tạo bài tập điền từ. Lược bỏ tất cả các cột thừa (Synonym, Antonym...).
+2. CÂU HỎI TRẮC NGHIỆM: Bôi đậm chữ Question, bôi đậm A, B, C, D và dàn đều trên 1 dòng."""
 
     user_prompt = st.text_area(
-        "2. Yêu cầu xử lý:", value=EDUCATIONAL_SYSTEM_PROMPT, height=350
+        "2. Yêu cầu xử lý:", value=default_user_prompt, height=250
     )
     process_btn = st.button(
         "🚀 Bắt đầu tạo Bản Nháp", type="primary", use_container_width=True
@@ -349,6 +463,40 @@ if st.session_state.draft_text:
             file_name="DeThi_HoanThien.docx",
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         )
+
+        st.divider()
+        st.markdown("### 🎮 Xuất file Game (Kahoot/Blooket)")
+
+        if st.button("🎲 Tự động Giải đề & Trích xuất File Game", type="secondary"):
+            with st.spinner(
+                "🤖 AI đang làm bài để tìm đáp án đúng và phân loại dữ liệu..."
+            ):
+                quiz_data = extract_quiz_to_json(st.session_state.draft_text)
+
+                if quiz_data:
+                    kahoot_file, blooket_file = generate_edtech_files(quiz_data)
+                    st.success("Đã trích xuất thành công! Hãy tải file bên dưới:")
+
+                    # Nút tải file Kahoot
+                    st.download_button(
+                        label="🟣 Tải file Excel cho KAHOOT!",
+                        data=kahoot_file,
+                        file_name="Kahoot_Template.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+
+                    # Nút tải file Blooket
+                    st.download_button(
+                        label="🟦 Tải file CSV cho BLOOKET",
+                        data=blooket_file,
+                        file_name="Blooket_Template.csv",  # Đổi đuôi về CSV
+                        mime="text/csv",  # Đổi mime type
+                    )
+                else:
+                    st.error(
+                        "❌ Không tìm thấy câu hỏi trắc nghiệm hoặc có lỗi xảy ra."
+                    )
+
         st.container(height=500, border=True).markdown(st.session_state.draft_text)
 
     with col_chat:
