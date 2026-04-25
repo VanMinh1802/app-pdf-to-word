@@ -1,6 +1,8 @@
 import streamlit as st
 import pdfplumber
 import re
+import os
+import shutil
 import io
 import base64
 import pandas as pd
@@ -8,6 +10,9 @@ import json
 import csv
 import time
 import concurrent.futures
+import fitz
+from PIL import Image
+import pytesseract
 from docx.shared import Pt, RGBColor, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import nsdecls
@@ -15,6 +20,7 @@ from docx.oxml import parse_xml
 from docx import Document
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage
+from google.genai.types import HarmBlockThreshold, HarmCategory
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -23,35 +29,134 @@ st.set_page_config(page_title="AI PDF to Word", page_icon="📄", layout="wide")
 st.title("📄 Trợ lý AI: Biên tập Đề Thi & Tài Liệu")
 
 
+GEMINI_MODEL_NAME = "gemini-2.5-flash"
+
+# Lưu ý: API safety_settings hiện chỉ chấp nhận các category "core" bên dưới.
+GEMINI_SAFETY_SETTINGS = {
+    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY: HarmBlockThreshold.BLOCK_NONE,
+}
+
+
+def build_gemini_model(temperature=0.1):
+    return ChatGoogleGenerativeAI(
+        model=GEMINI_MODEL_NAME,
+        temperature=temperature,
+        safety_settings=GEMINI_SAFETY_SETTINGS,
+        max_output_tokens=8192,
+    )
+
+
+def clean_ai_output(text):
+    """Làm sạch output từ AI: loại bỏ backslash escape thừa."""
+    if not text:
+        return text
+    # Loại bỏ backslash trước dấu gạch dưới: \_ → _
+    return re.sub(r"\\_", "_", text)
+
+
+def _configure_tesseract_cmd_if_possible():
+    env_cmd = os.getenv("TESSERACT_CMD")
+    candidates = [
+        env_cmd,
+        r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe",
+        r"C:\\Program Files (x86)\\Tesseract-OCR\\tesseract.exe",
+    ]
+    for cmd in candidates:
+        if cmd and os.path.exists(cmd):
+            pytesseract.pytesseract.tesseract_cmd = cmd
+            return
+
+
+def is_tesseract_available():
+    try:
+        _configure_tesseract_cmd_if_possible()
+        if shutil.which(
+            pytesseract.pytesseract.tesseract_cmd
+        ) is None and not os.path.exists(pytesseract.pytesseract.tesseract_cmd):
+            return False
+        pytesseract.get_tesseract_version()
+        return True
+    except Exception:
+        return False
+
+
+def ocr_images_with_tesseract(images):
+    if not is_tesseract_available():
+        raise RuntimeError("TESSERACT_NOT_AVAILABLE")
+
+    texts = []
+    for img in images:
+        # Ưu tiên OCR tiếng Việt + tiếng Anh; nếu thiếu data thì rơi về tiếng Anh.
+        try:
+            texts.append(pytesseract.image_to_string(img, lang="vie+eng"))
+        except Exception:
+            texts.append(pytesseract.image_to_string(img, lang="eng"))
+    return "\n\n".join([t for t in texts if t])
+
+
 # ==========================================
 # CÁC HÀM XỬ LÝ PDF
 # ==========================================
 def extract_text_from_upload(uploaded_file):
     text = ""
+    pdf_bytes = b""
     try:
         uploaded_file.seek(0)
-        pdf_buffer = io.BytesIO(uploaded_file.read())
+        pdf_bytes = uploaded_file.read()
+        pdf_buffer = io.BytesIO(pdf_bytes)
         with pdfplumber.open(pdf_buffer) as pdf:
             for page in pdf.pages:
                 extracted = page.extract_text()
                 if extracted:
                     text += extracted + "\n"
     except Exception as e:
-        st.error(f"❌ Lỗi đọc chữ PDF: {e}")
+        st.error(f"❌ Lỗi đọc chữ PDF (pdfplumber): {e}")
+
+    # Fallback: nhiều PDF pdfplumber trích xuất rỗng nhưng PyMuPDF đọc được text.
+    if not text.strip() and pdf_bytes:
+        try:
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            for page in doc:
+                extracted = page.get_text("text")
+                if extracted:
+                    text += extracted + "\n"
+        except Exception as e:
+            st.error(f"❌ Lỗi đọc chữ PDF (PyMuPDF): {e}")
     return text
 
 
 def extract_images_from_upload(uploaded_file):
     images = []
+    pdf_bytes = b""
     try:
         uploaded_file.seek(0)
-        pdf_buffer = io.BytesIO(uploaded_file.read())
-        with pdfplumber.open(pdf_buffer) as pdf:
-            for page in pdf.pages:
-                img = page.to_image(resolution=150).original
-                images.append(img)
+        pdf_bytes = uploaded_file.read()
+
+        # Ưu tiên PyMuPDF để render ổn định (tránh nền đen do alpha/transparent)
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        zoom = 150 / 72  # 150 dpi
+        matrix = fitz.Matrix(zoom, zoom)
+        for page in doc:
+            pix = page.get_pixmap(matrix=matrix, alpha=True)
+            img_rgba = Image.frombytes("RGBA", (pix.width, pix.height), pix.samples)
+            white_bg = Image.new("RGB", img_rgba.size, (255, 255, 255))
+            white_bg.paste(img_rgba, mask=img_rgba.split()[3])
+            images.append(white_bg)
     except Exception as e:
-        st.error(f"❌ Lỗi chuyển PDF thành ảnh: {e}")
+        # Fallback cuối: dùng pdfplumber render ảnh
+        try:
+            uploaded_file.seek(0)
+            pdf_buffer = io.BytesIO(pdf_bytes or uploaded_file.read())
+            with pdfplumber.open(pdf_buffer) as pdf:
+                for page in pdf.pages:
+                    img = page.to_image(resolution=150).original
+                    images.append(img)
+        except Exception as e2:
+            st.error(f"❌ Lỗi chuyển PDF thành ảnh: {e2}")
     return images
 
 
@@ -62,95 +167,114 @@ EDUCATIONAL_SYSTEM_PROMPT = """Bạn là một Chuyên gia Biên tập Đề thi
 Nhiệm vụ của bạn là định dạng lại văn bản cực kỳ CHÍNH XÁC theo cấu trúc chuẩn.
 LƯU Ý TỐI QUAN TRỌNG:
 1. MARKDOWN: Dùng dấu sao đôi để in đậm (**chữ**). KHÔNG dùng thẻ HTML.
-2. CÂU HỎI TRẮC NGHIỆM: 
+2. BẢNG TỪ VỰNG (Vocabulary): Giữ nguyên đầy đủ các cột (STT, Word, Part of speech, Pronunciation, Meaning). Định dạng bằng markdown table.
+3. BẢNG CẤU TRÚC (Structures): Giữ nguyên đầy đủ các cột. Định dạng bằng markdown table.
+4. QUIZ (Điền từ): Giữ nguyên câu hỏi và các lựa chọn (dạng A/B hoặc A/B/C).
+5. GRAMMAR: Giữ nguyên nội dung ngữ pháp, ví dụ, công thức.
+6. CÂU HỎI TRẮC NGHIỆM (Multiple Choice):
    - Bắt buộc in đậm chữ Question và số (VD: **Question 1.**). KHÔNG in đậm nội dung câu hỏi.
    - Bắt buộc in đậm các chữ cái đáp án (VD: **A.**, **B.**, **C.**, **D.**).
    - Các đáp án phải nằm trên cùng một dòng.
-3. BẢNG BIỂU: Xử lý số lượng cột, nội dung cột CHÍNH XÁC theo yêu cầu của người dùng. Hãy linh hoạt thêm, bớt hoặc làm trống nội dung theo đúng mệnh lệnh.
-4. LỌC RÁC: Xóa các thông tin như Link web, số điện thoại, tên giáo viên ở đầu/cuối tài liệu.
-5. ĐOẠN VĂN ĐỌC HIỂU: Giữ nguyên sự liền mạch, không tự ý ngắt dòng giữa câu.
-6. KHÔNG giao tiếp, KHÔNG giải thích. CHỈ TRẢ VỀ văn bản đã được biên tập."""
+7. ĐỌC HIỂU (Reading Comprehension):
+   - Giữ nguyên sự liền mạch của đoạn văn, không tự ý ngắt dòng giữa câu.
+   - Chỗ điền từ (blanks) dùng dấu gạch dưới: _____ (5 dấu).
+8. LỌC RÁC: Xóa các thông tin như Link web, số điện thoại, tên giáo viên ở đầu/cuối tài liệu.
+9. KHÔNG bỏ sót bất kỳ phần nào: Vocabulary, Structures, Quiz, Grammar, Practice, Reading.
+10. KHÔNG giao tiếp, KHÔNG giải thích. CHỈ TRẢ VỀ văn bản đã được biên tập."""
 
 
 def process_text_with_ai(raw_text, user_prompt):
-    model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.1)
+    model = build_gemini_model(temperature=0.1)
     full_prompt = f"{EDUCATIONAL_SYSTEM_PROMPT}\n\nYÊU CẦU CỦA NGƯỜI DÙNG:\n{user_prompt}\n\nNỘI DUNG TÀI LIỆU GỐC:\n<document>\n{raw_text}\n</document>"
-    return model.invoke(full_prompt).content
+    return clean_ai_output(model.invoke(full_prompt).content)
 
 
-# --- Hàm phụ để xử lý từng lô (Batch) ---
-def process_single_batch(batch_images, batch_index, total_batches, user_prompt):
-    model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.1)
-
-    content = [
-        {
-            "type": "text",
-            "text": f"{EDUCATIONAL_SYSTEM_PROMPT}\n\nYêu cầu: {user_prompt}\n(Đây là Phần {batch_index}/{total_batches})",
-        }
-    ]
-
-    for img in batch_images:
-        buffered = io.BytesIO()
-        img.save(buffered, format="JPEG")
-        img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
-        content.append(
-            {
-                "type": "image_url",
-                "image_url": {"url": f"data:image/jpeg;base64,{img_str}"},
-            }
-        )
-
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            return model.invoke([HumanMessage(content=content)]).content
-        except Exception as e:
-            if ("503" in str(e) or "429" in str(e)) and attempt < max_retries - 1:
-                time.sleep(10 + attempt * 5)  # Nghỉ lâu hơn nếu bị lỗi
-                continue
-            return f"\n[Lỗi Phần {batch_index}: {e}]\n"
+# --- HÀM XỬ LÝ SINGLE PAGE ĐÃ ĐƯỢC VIẾT LẠI TRONG process_vision_with_ai ---
+# XÓA HÀM CŨ ĐỂ TRÁNH RUNTIME ERROR
 
 
 # --- Hàm chính xử lý song song ---
 def process_vision_with_ai(images, user_prompt):
-    # Cấu hình: 2 ảnh/lô và chạy tối đa 4 luồng song song
-    batch_size = 2
-    max_workers = 4
+    total_pages = len(images)
 
-    batches = [images[i : i + batch_size] for i in range(0, len(images), batch_size)]
-    total_batches = len(batches)
-
-    # Dùng ThreadPoolExecutor để chạy song song
     results_map = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Gửi tất cả các phần đi xử lý
-        future_to_batch = {
-            executor.submit(
-                process_single_batch, batches[i], i + 1, total_batches, user_prompt
-            ): i
-            for i in range(total_batches)
-        }
+    debug_map = {}
 
-        # Thu thập kết quả khi các luồng hoàn thành
-        for future in concurrent.futures.as_completed(future_to_batch):
-            batch_idx = future_to_batch[future]
-            try:
-                results_map[batch_idx] = future.result()
-            except Exception:
-                results_map[batch_idx] = (
-                    f"\n[Lỗi nghiêm trọng ở phần {batch_idx + 1}]\n"
-                )
+    # XỬ LÝ MỖI TRANG RIÊNG BIỆT - MỖI TRANG 1 REQUEST (FIX BỎ SÓT TRANG)
+    for page_num in range(total_pages):
+        try:
+            print(f"Processing page {page_num + 1}/{total_pages}...")
+
+            # Gửi MỖI TRANG RIÊNG LẺ, KHÔNG GỬI NHIỀU ẢNH CÙNG LÚC
+            current_image = images[page_num]
+
+            full_result = ""
+
+            # Retry tối đa 3 lần nếu output ngắn
+            for attempt in range(3):
+                # TẠO MODEL MỚI MỖI LẦN REQUEST
+                model = build_gemini_model(temperature=0.1)
+
+                # Encode image to base64
+                img_buffer = io.BytesIO()
+                current_image.save(img_buffer, format="JPEG")
+                img_base64 = base64.b64encode(img_buffer.getvalue()).decode("utf-8")
+
+                content = [
+                    {
+                        "type": "text",
+                        "text": f"{EDUCATIONAL_SYSTEM_PROMPT}\n\nYêu cầu: {user_prompt}\n\nRẤT QUAN TRỌNG: ĐÂY LÀ TRANG {page_num + 1} / {total_pages}. HÃY TRÍCH XUẤT TOÀN BỘ NỘI DUNG CỦA TRANG NÀY ĐƠN ĐỘC, KHÔNG BỎ SÓT BẤT KỲ NỘI DUNG NÀO.",
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{img_base64}"},
+                    },
+                ]
+
+                try:
+                    resp = model.invoke([HumanMessage(content=content)])
+                    text = clean_ai_output(str(getattr(resp, "content", "") or ""))
+                    text_len = len(text.strip())
+
+                    print(f"  Attempt {attempt + 1}: {text_len} chars")
+
+                    if text_len >= 300:
+                        full_result = text
+                        break  # Đủ nội dung rồi
+
+                    time.sleep(3 + attempt * 2)
+
+                except Exception as e:
+                    print(f"  Error: {str(e)[:100]}")
+                    time.sleep(5)
+                    continue
+
+            results_map[page_num] = full_result
+            debug_map[page_num] = {
+                "page": page_num + 1,
+                "text_len": len(full_result),
+                "attempts": attempt + 1,
+            }
+
+            # Delay 4 giây giữa các trang
+            time.sleep(4)
+
+        except Exception as e:
+            results_map[page_num] = ""
+            debug_map[page_num] = {"page": page_num + 1, "error": str(e)}
 
     # Ghép kết quả theo đúng thứ tự từ đầu đến cuối
-    full_result = ""
-    for i in range(total_batches):
-        full_result += results_map[i] + "\n\n"
+    full_final_result = ""
+    for i in range(total_pages):
+        if results_map[i].strip():
+            full_final_result += results_map[i] + "\n\n---\n\n"
 
-    return full_result
+    vision_debug = [debug_map.get(i, {"page": i + 1}) for i in range(total_pages)]
+    return full_final_result, vision_debug
 
 
 def refine_text_with_ai(current_text, refinement_prompt, image_bytes=None):
-    model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.1)
+    model = build_gemini_model(temperature=0.1)
     if image_bytes:
         img_b64 = base64.b64encode(image_bytes).decode("utf-8")
         content = [
@@ -163,10 +287,10 @@ def refine_text_with_ai(current_text, refinement_prompt, image_bytes=None):
                 "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
             },
         ]
-        return model.invoke([HumanMessage(content=content)]).content
+        return clean_ai_output(model.invoke([HumanMessage(content=content)]).content)
     else:
         full_prompt = f"{EDUCATIONAL_SYSTEM_PROMPT}\n\nBẢN THẢO HIỆN TẠI:\n<draft>\n{current_text}\n</draft>\n\nYÊU CẦU SỬA LỖI:\n{refinement_prompt}"
-        return model.invoke(full_prompt).content
+        return clean_ai_output(model.invoke(full_prompt).content)
 
 
 def is_service_unavailable_error(error):
@@ -181,6 +305,28 @@ def is_service_unavailable_error(error):
 # ==========================================
 # 5. HÀM GHI FILE WORD (THUẬT TOÁN BẢNG TÀNG HÌNH CHIA ĐỀU)
 # ==========================================
+def preprocess_text_for_word(text):
+    """Làm sạch text trước khi tạo Word: thu gọn gạch dưới dài, xóa dòng gạch dư."""
+    if not text:
+        return text
+    # Thu gọn mọi chuỗi gạch dưới từ 4+ dấu thành 5 dấu (tránh giãn quá dài trong Word)
+    text = re.sub(r"_{4,}", "_____", text)
+    # Thu gọn chuỗi gạch ngang từ 4+ dấu thành 3 dấu
+    text = re.sub(r"-{4,}", "---", text)
+    lines = text.split("\n")
+    cleaned = []
+    for line in lines:
+        stripped = line.strip()
+        # Bỏ qua dòng chỉ chứa ký tự gạch/phân cách
+        if (
+            re.match(r"^[\s\-_.*=!]+$", stripped)
+            and len(re.findall(r"[\-_.*=!]", stripped)) >= 2
+        ):
+            continue
+        cleaned.append(line)
+    return "\n".join(cleaned)
+
+
 def create_word_docx(processed_text):
     doc = Document()
 
@@ -195,6 +341,7 @@ def create_word_docx(processed_text):
     title.runs[0].font.color.rgb = RGBColor(30, 136, 229)
     doc.add_paragraph()
 
+    processed_text = preprocess_text_for_word(processed_text)
     lines = processed_text.split("\n")
     current_table = None
     is_first_row = False
@@ -202,6 +349,15 @@ def create_word_docx(processed_text):
     for line in lines:
         line_stripped = line.strip()
         if not line_stripped:
+            current_table = None
+            continue
+
+        # Bỏ qua các dòng chỉ chứa ký tự gạch/phân cách
+        # (---, ___, ..., -----, _____, ........, _ _ _, - - -, v.v.)
+        if (
+            re.match(r"^[\s\-_.*=!]+$", line_stripped)
+            and len(re.findall(r"[\-_.*=!]", line_stripped)) >= 2
+        ):
             current_table = None
             continue
 
@@ -332,7 +488,7 @@ def create_word_docx(processed_text):
 # ==========================================
 def extract_quiz_to_json(text):
     # Dùng 1.5-flash để tốc độ nhanh và chịu tải text dài tốt hơn
-    model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.1)
+    model = build_gemini_model(temperature=0.1)
 
     prompt = f"""
     Đọc tài liệu sau và tìm TẤT CẢ các câu hỏi trắc nghiệm. 
@@ -362,7 +518,7 @@ def extract_quiz_to_json(text):
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            response = model.invoke(prompt).content
+            response = clean_ai_output(model.invoke(prompt).content)
             clean_json = response.replace("```json", "").replace("```", "").strip()
 
             # Cố gắng dịch cục text thành JSON
@@ -489,8 +645,11 @@ with st.sidebar:
 
     # YÊU CẦU MẶC ĐỊNH (Người dùng có thể xóa đi gõ lại trên Web)
     default_user_prompt = """Biên tập tài liệu này theo đúng chuẩn form đề thi:
-1. BẢNG TỪ VỰNG: CHỈ GIỮ LẠI ĐÚNG 2 CỘT là "Word" và "Meaning". ĐẶC BIỆT: Hãy XÓA SẠCH nội dung trong cột "Meaning" (để trống ô đó) để tạo bài tập điền từ. Lược bỏ tất cả các cột thừa (Synonym, Antonym...).
-2. CÂU HỎI TRẮC NGHIỆM: Bôi đậm chữ Question, bôi đậm A, B, C, D và dàn đều trên 1 dòng."""
+1. BẢNG TỪ VỰNG & BẢNG CẤU TRÚC: Giữ nguyên đầy đủ các cột, định dạng bằng markdown table.
+2. QUIZ & GRAMMAR: Giữ nguyên nội dung, định dạng rõ ràng.
+3. CÂU HỎI TRẮC NGHIỆM: Bôi đậm chữ Question, bôi đậm A, B, C, D và dàn đều trên 1 dòng nếu đáp án trắc nghiệm ngắn có thể dàn đủ trên 1 dòng, nếu đáp án trắc nghiệm dài hãy để mỗi đáp án trắc nghiệm 1 dòng.
+4. ĐỌC HIỂU: Giữ nguyên đoạn văn liền mạch, chỗ điền từ dùng _____, giữ nguyên số câu ở trước (ví dụ (12)_______).
+5. Giữ nguyên layout, format, font, nhất là các từ đang được in đậm hay gạch chân."""
 
     user_prompt = st.text_area(
         "2. Yêu cầu xử lý:", value=default_user_prompt, height=250
@@ -503,45 +662,170 @@ if process_btn:
     if not uploaded_pdf:
         st.sidebar.error("Bạn chưa tải file PDF lên!")
     else:
+        should_rerun = False
         with st.status("Đang phân tích tài liệu...", expanded=True) as status:
             try:  # BẮT ĐẦU MẶC ÁO GIÁP
                 st.write("Đang quét nội dung...")
                 raw_text = extract_text_from_upload(uploaded_pdf)
 
+                mode_used = "text" if raw_text.strip() else "vision"
+                result = ""
+                vision_debug = None
+
                 if not raw_text.strip():
-                    st.write("Phát hiện PDF ảnh scan! Chuyển sang Mắt thần Vision...")
+                    st.write("Phát hiện PDF ảnh scan! Sử dụng OCR + AI...")
                     images = extract_images_from_upload(uploaded_pdf)
 
-                    # BẪY UX: Cảnh báo nếu file quá dài (Tránh lỗi 503)
-                    if len(images) > 6:
-                        st.warning(
-                            f"⚠️ Tài liệu này có {len(images)} trang ảnh. Gửi file quá lớn có thể khiến AI Google từ chối phục vụ (Lỗi 503). Khuyên dùng file dưới 6 trang."
+                    if not images:
+                        status.update(
+                            label="Không render được ảnh từ PDF",
+                            state="error",
+                            expanded=True,
                         )
+                        st.error(
+                            "❌ Không chuyển PDF sang ảnh được. "
+                            "Bạn thử mở lại PDF để chắc chắn file không lỗi."
+                        )
+                        raise RuntimeError("PDF_TO_IMAGE_EMPTY")
 
-                    result = process_vision_with_ai(images, user_prompt)
+                    # Sử dụng OCR Tesseract để trích xuất text từ tất cả trang
+                    st.write("Đang trích xuất text từ tất cả trang bằng OCR...")
+                    try:
+                        ocr_full_text = ocr_images_with_tesseract(images)
+                    except Exception as ocr_err:
+                        st.error(f"❌ Lỗi OCR: {ocr_err}")
+                        ocr_full_text = ""
+
+                    if str(ocr_full_text or "").strip():
+                        st.write("Đang định dạng text OCR theo chuẩn đề thi...")
+                        result = process_text_with_ai(ocr_full_text, user_prompt)
+                        mode_used = "ocr+ai"
+                    else:
+                        st.warning(
+                            "⚠️ OCR không đọc được chữ, chuyển sang Vision API..."
+                        )
+                        # Fallback sang Vision API nếu OCR thất bại
+                        result, vision_debug = process_vision_with_ai(
+                            images, user_prompt
+                        )
+                        st.session_state.last_vision_debug = vision_debug
                 else:
                     st.write("Đang định dạng theo chuẩn đề thi...")
                     result = process_text_with_ai(raw_text, user_prompt)
 
-                st.session_state.draft_text = result
-                st.session_state.chat_history = [
-                    {
-                        "role": "assistant",
-                        "content": "Tài liệu đã được định dạng. Cột Meaning đã được làm trống. Sếp kiểm tra lại nhé!",
-                    }
-                ]
-                status.update(label="Hoàn tất xử lý!", state="complete", expanded=False)
+                result_text = str(result or "")
+
+                # Nếu là file scan mà Vision trả rỗng -> thử OCR local (Tesseract)
+                if (
+                    not raw_text.strip()
+                    and not result_text.strip()
+                    and "images" in locals()
+                ):
+                    st.write("AI Vision trả rỗng. Đang thử OCR local (Tesseract)...")
+                    try:
+                        ocr_text = ocr_images_with_tesseract(images)
+                    except Exception as ocr_err:
+                        # Để nhánh bên dưới hiển thị thông báo + hướng dẫn
+                        ocr_text = ""
+                        st.session_state.last_ocr_error = str(ocr_err)
+                    else:
+                        st.session_state.last_ocr_error = None
+
+                    if str(ocr_text or "").strip():
+                        st.write("Đang định dạng lại từ text OCR...")
+                        formatted_from_ocr = process_text_with_ai(ocr_text, user_prompt)
+                        formatted_text = str(formatted_from_ocr or "")
+
+                        if formatted_text.strip():
+                            result_text = formatted_text
+                            mode_used = "ocr+ai"
+                        else:
+                            st.warning(
+                                "⚠️ AI vẫn trả rỗng sau OCR. Hệ thống sẽ hiển thị text OCR thô để bạn lấy nội dung."
+                            )
+                            result_text = ocr_text
+                            mode_used = "ocr_raw"
+
+                if not result_text.strip():
+                    # Gemini đôi khi trả về chuỗi rỗng (bị chặn/recitation hoặc lỗi im lặng).
+                    # Đừng giả vờ thành công; rơi về text thô nếu có.
+                    if raw_text.strip():
+                        st.warning(
+                            "⚠️ AI trả về nội dung rỗng. Hệ thống sẽ tạm hiển thị TEXT THÔ trích xuất từ PDF để bạn vẫn lấy được nội dung."
+                        )
+                        result_text = raw_text
+                        st.session_state.chat_history = [
+                            {
+                                "role": "assistant",
+                                "content": "⚠️ AI trả về rỗng, mình đang hiển thị text thô trích xuất từ PDF để bạn kiểm tra.",
+                            }
+                        ]
+                        status.update(
+                            label="AI trả rỗng → đã rơi về text thô",
+                            state="complete",
+                            expanded=False,
+                        )
+                        should_rerun = True
+                    else:
+                        status.update(label="AI trả rỗng", state="error", expanded=True)
+                        st.error(
+                            "❌ Không trích xuất được chữ từ PDF (có thể là file scan) và AI Vision cũng trả về rỗng. "
+                            "Bạn thử cắt nhỏ PDF (1–3 trang) hoặc dùng OCR local (Tesseract)."
+                        )
+
+                        if not is_tesseract_available():
+                            with st.expander("🛠️ Cài Tesseract để bật OCR local"):
+                                st.markdown(
+                                    "- Windows (khuyến nghị): `winget install -e --id UB-Mannheim.TesseractOCR`\n"
+                                    "- Sau khi cài, mở terminal mới và chạy: `tesseract --version`\n"
+                                    "- Nếu vẫn không nhận: đặt biến môi trường `TESSERACT_CMD` trỏ tới `tesseract.exe` (thường ở `C:/Program Files/Tesseract-OCR/tesseract.exe`)."
+                                )
+
+                        with st.expander("🔎 Debug (thông tin tối thiểu)"):
+                            st.write(
+                                {
+                                    "mode_used": mode_used,
+                                    "raw_text_len": len(raw_text or ""),
+                                    "images_len": len(images)
+                                    if "images" in locals()
+                                    else None,
+                                    "vision_debug": st.session_state.get(
+                                        "last_vision_debug"
+                                    ),
+                                    "ocr_available": is_tesseract_available(),
+                                    "ocr_error": st.session_state.get("last_ocr_error"),
+                                }
+                            )
+                else:
+                    st.session_state.draft_text = result_text.strip()
+                    st.session_state.chat_history = [
+                        {
+                            "role": "assistant",
+                            "content": "Tài liệu đã được định dạng đầy đủ. Sếp kiểm tra lại nhé!",
+                        }
+                    ]
+                    status.update(
+                        label="Hoàn tất xử lý!", state="complete", expanded=False
+                    )
+                    should_rerun = True
+
+                if should_rerun:
+                    st.session_state.draft_text = result_text.strip()
 
             except Exception as e:
-                if is_service_unavailable_error(e):
-                    status.update(label="Lỗi máy chủ AI", state="error", expanded=False)
+                if str(e) == "PDF_TO_IMAGE_EMPTY":
+                    pass
+                elif is_service_unavailable_error(e):
+                    status.update(label="Lỗi máy chủ AI", state="error", expanded=True)
                     st.error(
                         "🤖 Máy chủ Google Gemini hiện đang quá tải (Lỗi 503) hoặc file của bạn quá nặng. Vui lòng cắt nhỏ file PDF ra hoặc chờ 1 phút rồi thử lại nhé!"
                     )
                 else:
-                    status.update(label="Lỗi hệ thống", state="error", expanded=False)
+                    status.update(label="Lỗi hệ thống", state="error", expanded=True)
                     st.error(f"❌ Có lỗi xảy ra trong quá trình xử lý: {e}")
-        st.rerun()
+
+        if should_rerun:
+            st.rerun()
 
 if st.session_state.draft_text:
     col_preview, col_chat = st.columns([1.2, 1], gap="large")
@@ -605,7 +889,9 @@ if st.session_state.draft_text:
                     use_container_width=True,
                 )
 
-        st.container(height=500, border=True).markdown(st.session_state.draft_text)
+        # Làm sạch text trước khi hiển thị preview
+        preview_text = preprocess_text_for_word(st.session_state.draft_text)
+        st.container(height=500, border=True).markdown(preview_text)
 
     with col_chat:
         st.subheader("💬 Chat với Biên Tập Viên")
