@@ -22,6 +22,8 @@ except Exception:
 
 st.set_page_config(page_title="AI Resume Pro", page_icon="🚀", layout="wide")
 
+GEMINI_MODEL = "gemini-3.8-flash"
+
 api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
 if not api_key:
     st.sidebar.warning(
@@ -72,7 +74,7 @@ if uploaded_file:
         if st.button("Bắt đầu Chấm điểm", type="primary", key="btn_ats"):
             with st.spinner("AI đang 'soi' CV và chấm điểm..."):
                 model_ats = ChatGoogleGenerativeAI(
-                    model="gemini-2.5-flash", temperature=0.3
+                    model=GEMINI_MODEL, temperature=0.3
                 )
                 prompt_ats = f"""
                 Bạn là một hệ thống ATS thông minh và chuyên gia HR. Phân tích CV cho vị trí: {job_role}.
@@ -118,7 +120,7 @@ if uploaded_file:
         if st.button("Tạo bộ câu hỏi Phỏng vấn", type="primary", key="btn_interview"):
             with st.spinner("Tech Lead đang chuẩn bị câu hỏi..."):
                 model_interview = ChatGoogleGenerativeAI(
-                    model="gemini-2.5-flash", temperature=0.7
+                    model=GEMINI_MODEL, temperature=0.7
                 )
                 prompt_interview = f"""
                 Bạn là Tech Lead phỏng vấn ứng viên cho vị trí: {job_role}.
@@ -157,7 +159,7 @@ if uploaded_file:
 
                 # Khởi tạo mô hình
                 chat_model = ChatGoogleGenerativeAI(
-                    model="gemini-2.5-flash", temperature=0.5
+                    model=GEMINI_MODEL, temperature=0.5
                 )
 
                 # Xây dựng bộ nhớ (Truyền CV vào tiềm thức của AI + lịch sử chat)

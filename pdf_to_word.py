@@ -44,7 +44,7 @@ if not api_key:
     )
 
 
-GEMINI_MODEL_NAME = "gemini-2.5-flash"
+GEMINI_MODEL_NAME = "gemini-3.8-flash"
 
 # Lưu ý: API safety_settings hiện chỉ chấp nhận các category "core" bên dưới.
 GEMINI_SAFETY_SETTINGS = {
