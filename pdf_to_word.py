@@ -25,8 +25,23 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Hỗ trợ lấy API Key từ Streamlit Secrets khi deploy lên Streamlit Cloud
+try:
+    if "GOOGLE_API_KEY" in st.secrets and not os.getenv("GOOGLE_API_KEY"):
+        os.environ["GOOGLE_API_KEY"] = st.secrets["GOOGLE_API_KEY"]
+    if "GEMINI_API_KEY" in st.secrets and not os.getenv("GEMINI_API_KEY"):
+        os.environ["GEMINI_API_KEY"] = st.secrets["GEMINI_API_KEY"]
+except Exception:
+    pass
+
 st.set_page_config(page_title="AI PDF to Word", page_icon="📄", layout="wide")
 st.title("📄 Trợ lý AI: Biên tập Đề Thi & Tài Liệu")
+
+api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+if not api_key:
+    st.sidebar.warning(
+        "⚠️ Chưa tìm thấy API Key! Vui lòng cấu hình GOOGLE_API_KEY trong Streamlit Secrets (App Settings > Secrets)."
+    )
 
 
 GEMINI_MODEL_NAME = "gemini-2.5-flash"

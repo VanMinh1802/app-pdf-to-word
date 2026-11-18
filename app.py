@@ -2,6 +2,7 @@ import streamlit as st
 import PyPDF2
 import re
 import time
+import os
 
 # Import thêm các class để phân biệt người dùng và AI
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
@@ -10,7 +11,22 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Hỗ trợ lấy API Key từ Streamlit Secrets khi deploy lên Streamlit Cloud
+try:
+    if "GOOGLE_API_KEY" in st.secrets and not os.getenv("GOOGLE_API_KEY"):
+        os.environ["GOOGLE_API_KEY"] = st.secrets["GOOGLE_API_KEY"]
+    if "GEMINI_API_KEY" in st.secrets and not os.getenv("GEMINI_API_KEY"):
+        os.environ["GEMINI_API_KEY"] = st.secrets["GEMINI_API_KEY"]
+except Exception:
+    pass
+
 st.set_page_config(page_title="AI Resume Pro", page_icon="🚀", layout="wide")
+
+api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+if not api_key:
+    st.sidebar.warning(
+        "⚠️ Chưa tìm thấy API Key! Vui lòng cấu hình GOOGLE_API_KEY trong Streamlit Secrets (App Settings > Secrets)."
+    )
 st.title("🚀 Hệ thống Tối ưu CV Toàn diện")
 
 
@@ -56,7 +72,7 @@ if uploaded_file:
         if st.button("Bắt đầu Chấm điểm", type="primary", key="btn_ats"):
             with st.spinner("AI đang 'soi' CV và chấm điểm..."):
                 model_ats = ChatGoogleGenerativeAI(
-                    model="gemini-3.8-flash", temperature=0.3
+                    model="gemini-2.5-flash", temperature=0.3
                 )
                 prompt_ats = f"""
                 Bạn là một hệ thống ATS thông minh và chuyên gia HR. Phân tích CV cho vị trí: {job_role}.
