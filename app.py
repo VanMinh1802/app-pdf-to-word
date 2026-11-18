@@ -56,7 +56,7 @@ if uploaded_file:
         if st.button("Bắt đầu Chấm điểm", type="primary", key="btn_ats"):
             with st.spinner("AI đang 'soi' CV và chấm điểm..."):
                 model_ats = ChatGoogleGenerativeAI(
-                    model="gemini-2.5-flash", temperature=0.3
+                    model="gemini-3.8-flash", temperature=0.3
                 )
                 prompt_ats = f"""
                 Bạn là một hệ thống ATS thông minh và chuyên gia HR. Phân tích CV cho vị trí: {job_role}.
