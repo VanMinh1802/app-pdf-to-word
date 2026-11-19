@@ -1,8 +1,10 @@
+import os
+os.environ["ARROW_DEFAULT_MEMORY_POOL"] = "system"
+
 import streamlit as st
 import PyPDF2
 import re
 import time
-import os
 
 # Import thêm các class để phân biệt người dùng và AI
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
