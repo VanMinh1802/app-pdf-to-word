@@ -1,18 +1,16 @@
 [theme]
-# Màu chủ đạo (Nút bấm, thanh trượt...)
 primaryColor = "#1E88E5" 
-
-# Màu nền chính của trang web
 backgroundColor = "#F4F6F9"
-
-# Màu nền của Sidebar và các khung phụ
 secondaryBackgroundColor = "#FFFFFF"
-
-# Màu chữ
 textColor = "#2C3E50"
-
-# Font chữ
 font = "sans serif"
 
 [client]
 showErrorDetails = "full"
+
+[server]
+address = "0.0.0.0"
+port = 8501
+headless = true
+enableCORS = false
+enableXsrfProtection = false
