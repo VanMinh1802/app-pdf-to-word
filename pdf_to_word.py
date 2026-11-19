@@ -1,7 +1,18 @@
+import os
+import warnings
+
+# Suppress warnings to prevent stderr noise or warning-as-error triggers
+warnings.filterwarnings("ignore")
+
+os.environ["ARROW_DEFAULT_MEMORY_POOL"] = "system"
+
 import streamlit as st
+
+# st.set_page_config MUST be the first Streamlit command called
+st.set_page_config(page_title="AI PDF to Word", page_icon="📄", layout="wide")
+
 import pdfplumber
 import re
-import os
 import shutil
 import io
 import base64
@@ -10,7 +21,12 @@ import json
 import csv
 import time
 import concurrent.futures
-import fitz
+
+try:
+    import pymupdf as fitz
+except ImportError:
+    import fitz
+
 from PIL import Image
 import pytesseract
 from docx.shared import Pt, RGBColor, Inches
@@ -34,7 +50,6 @@ try:
 except Exception:
     pass
 
-st.set_page_config(page_title="AI PDF to Word", page_icon="📄", layout="wide")
 st.title("📄 Trợ lý AI: Biên tập Đề Thi & Tài Liệu")
 
 api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
