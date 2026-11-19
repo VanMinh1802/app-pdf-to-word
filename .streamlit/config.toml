@@ -15,7 +15,4 @@ textColor = "#2C3E50"
 font = "sans serif"
 
 [client]
-showErrorDetails = "stacktrace"
-
-[server]
-headless = true
+showErrorDetails = "full"

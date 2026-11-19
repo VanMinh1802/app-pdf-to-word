@@ -1,10 +1,25 @@
 import os
+import warnings
+
+# Suppress warnings to prevent stderr noise or warning-as-error triggers
+warnings.filterwarnings("ignore")
+
 os.environ["ARROW_DEFAULT_MEMORY_POOL"] = "system"
 
 import streamlit as st
-import PyPDF2
+
+# st.set_page_config MUST be the first Streamlit command called
+st.set_page_config(page_title="AI Resume Pro", page_icon="🚀", layout="wide")
+
 import re
 import time
+
+try:
+    import pypdf
+    PdfReader = pypdf.PdfReader
+except ImportError:
+    import PyPDF2
+    PdfReader = PyPDF2.PdfReader
 
 # Import thêm các class để phân biệt người dùng và AI
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
@@ -22,8 +37,6 @@ try:
 except Exception:
     pass
 
-st.set_page_config(page_title="AI Resume Pro", page_icon="🚀", layout="wide")
-
 GEMINI_MODEL = "gemini-3.8-flash"
 
 api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
@@ -35,11 +48,12 @@ st.title("🚀 Hệ thống Tối ưu CV Toàn diện")
 
 
 def extract_text_from_pdf(pdf_file):
-    pdf_reader = PyPDF2.PdfReader(pdf_file)
+    pdf_reader = PdfReader(pdf_file)
     text = ""
     for page in pdf_reader.pages:
-        if page.extract_text():
-            text += page.extract_text() + "\n"
+        extracted = page.extract_text()
+        if extracted:
+            text += extracted + "\n"
     return text
 
 
